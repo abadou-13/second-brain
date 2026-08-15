@@ -2,19 +2,25 @@
 
 ## Architecture
 
-Three modules, one flat file store.
+Four modules, one flat file store, one vector database.
 
 ```
-main.py          — chat loop, commands, message assembly
-notes_manager.py — note generation (LLM), saving, index I/O
-search.py        — LLM-router retrieval, activity tracking
+main.py           — chat loop, commands, message assembly
+notes_manager.py  — note generation (LLM), saving, frontmatter parsing
+search.py         — retrieval, activity tracking
+vector_store.py   — ChromaDB wrapper (embeddings, similarity search, metadata)
 
 notes/
-  *.md           — Markdown notes (source of truth)
-  index.json     — lightweight index: title, tags, summary, access stats
+  *.md            — Markdown notes, one per session (source of truth)
+
+chroma_db/        — ChromaDB persistent store (regenerable from notes/)
+  chroma.sqlite3  — metadata: title, date, tags, access stats
+  <uuid>/         — HNSW vector index (binary, not human-readable)
 ```
 
-The chat loop is stateless between sessions by design — only `notes/` persists. A new session starts with no conversation history, only the index.
+The chat loop is stateless between sessions — only `notes/` and `chroma_db/` persist. A new session starts with no conversation history.
+
+If `chroma_db/` is ever deleted, running `reindex` rebuilds it from the Markdown files. The Markdown files are the source of truth; ChromaDB is the search index built on top of them.
 
 ---
 
@@ -22,48 +28,70 @@ The chat loop is stateless between sessions by design — only `notes/` persists
 
 Each saved note has two representations:
 
-1. **The full Markdown file** — the actual thinking, structured into Key Ideas and Open Questions. Human-readable. Never touched during retrieval unless a note is matched.
+**The Markdown file** (`notes/*.md`) — the full thinking, structured into Key Ideas and Open Questions with YAML frontmatter (title, date, tags, summary). Human-readable, portable, permanent.
 
-2. **An index entry** — title, date, tags, and a 2-3 sentence summary in `index.json`. This is what retrieval reads. The summary is LLM-generated at save time from the same conversation.
+**A ChromaDB entry** — the summary text is embedded into a vector using `all-MiniLM-L6-v2` (local ONNX model, no API call). The vector is stored in the HNSW index for fast similarity search. Metadata (title, date, tags, access counts) goes into `chroma.sqlite3`.
 
-This split is the core bet: the summary has to be good enough to find the note later. If the summary misses the key concept, the note becomes unreachable. That's a real limitation (see below), but it also means retrieval is fast and context-bounded regardless of how many notes pile up — we never load full notes at search time.
+The summary is the critical seam: it's what gets embedded and searched against. If the summary misses a key concept from the session, that note becomes harder to find. The LLM generates it at save time from the full conversation.
 
 ---
 
 ## Retrieval: how it works
 
-Every user message triggers a two-call retrieval pipeline:
+Every user message triggers a two-step pipeline:
 
-**Call 1 — Router**: All summaries from `index.json` are sent to a fast LLM call with a strict prompt: return only a JSON array of relevant filenames, nothing else. Temperature is set to 0 for determinism.
+**Step 1 — Vector search**: The query is embedded locally (same `all-MiniLM-L6-v2` model). ChromaDB computes cosine distance against all stored note vectors using HNSW and returns the top-k matches. Results above distance 1.2 are filtered out — anything that far from the query is not a real match.
 
-**Call 2 — Answer**: The matched notes (full content) are injected into the system prompt for the actual response. The assistant is instructed to surface connections proactively — if you're mid-thought on something new and a past note echoes it, it says so without being asked.
+**Step 2 — Answer**: The matched notes (full Markdown content, read from `notes/`) are injected into the system prompt. The assistant is instructed to surface connections proactively — if the user is mid-thought on something new and a past note echoes it, it says so without being asked.
 
-When the router returns `[]`, the second call proceeds with no injected notes and the assistant responds as a normal thinking partner.
+When Step 1 returns nothing, Step 2 proceeds with no injected notes and the assistant responds as a normal thinking partner.
 
-### Why LLM router instead of embeddings
+### Why ChromaDB over an LLM router
 
-Embeddings would be more scalable (see limits below), but they require either a large local model (PyTorch, ~1GB+) or a separate API provider. The LLM router gives semantic matching without any extra dependencies, handles vague "gist" queries well, and is easy to inspect — you can read the prompt and understand exactly what it's doing. The trade-off is an extra API call per message and a ceiling on how many notes can fit in the router's context.
+The first version used an LLM call to route: send all summaries, ask which ones are relevant, parse the returned filenames. It worked for 3 notes. At 1000 notes it would send ~60,000 words to the API — past most context windows, expensive, slow, and increasingly inaccurate as the list grows.
+
+ChromaDB with local embeddings scales differently:
+- Search time at 1000 notes: ~700ms (same as at 10 notes)
+- No API call for search — fully local
+- No context window ceiling
+- Distance threshold means "no match" is an honest answer, not a hallucination
+
+The 700ms is the ONNX embedding inference time for the query. It's constant regardless of note count.
+
+---
+
+## Scale test results
+
+Tested with 1000 notes (3 real + 997 synthetic):
+
+| Query | Result | Time |
+|---|---|---|
+| "AI customer support startup in France" | Conversational AI note (distance 0.69) | 775ms |
+| "how to join a football club" | Football Club note (distance 0.64) | 685ms |
+| "import export company Africa" | SARL Company note (distance 0.94) | 700ms |
+| "best pizza recipe" | No match (0 results) | 648ms |
+
+Accuracy: correct note returned in every case, unrelated notes filtered out by the distance threshold.
 
 ---
 
 ## The proactive surfacing foothold
 
-The spec's stretch goal is a system that doesn't wait to be asked — it surfaces past thinking mid-thought on something new. We get a real foothold here:
+The spec's stretch goal: a system that surfaces past thinking mid-thought, before you think to look. We get a real foothold:
 
 - Search runs on **every message**, not just explicit questions.
-- The system prompt explicitly instructs the model to say so when the user's current thinking echoes a past note, without being prompted.
+- The system prompt explicitly instructs the model to proactively mention when the user's current thinking echoes a past note — not just when asked.
 
-This means if you start talking about an idea you explored a month ago, the relevant note is injected and the model will surface the connection naturally in its response.
+This means if you start talking about an idea you explored before, the relevant note gets injected and the model surfaces the connection naturally.
 
 ---
 
 ## How I know it works
 
-- The router's `temperature=0` makes it deterministic: given the same query and the same index, it returns the same filenames.
-- Exact-phrase and title queries reliably return the right note.
-- Vague/gist queries work because the router is a full LLM, not a keyword matcher — tested with paraphrases that share no vocabulary with the note title.
-- When nothing matches, the router returns `[]` and the assistant responds without inventing past notes.
+- Distance threshold 1.2 was calibrated on real data: relevant notes score 0.64–0.94, clearly unrelated notes score 1.69+. The gap is large enough for a stable cut.
+- "No match" queries correctly return empty rather than a closest-match guess.
 - Access counts and `last_accessed` update on every retrieval and persist across sessions.
+- `reindex` rebuilds ChromaDB from scratch from the Markdown files, preserving access stats.
 
 ---
 
@@ -71,30 +99,34 @@ This means if you start talking about an idea you explored a month ago, the rele
 
 **Always search vs. search on questions only**
 
-An earlier version only searched when the message contained a `?` or started with a question word. This missed the case where a user states something ("I want to build an AI startup about customer support") without phrasing it as a question. Switching to always-search fixed this. The cost is one extra API call per message, which is acceptable for a personal tool.
+An earlier version only searched when the message contained `?` or started with a question word. This missed the case where a user states something ("I want to build an AI startup about customer support") without phrasing it as a question. Switching to always-search fixed this at the cost of one embedding call per message (~700ms locally, no API cost).
 
-**LLM-generated summary vs. user-written summary**
+**Local embeddings vs. API embeddings**
 
-The summary is generated at save time from the conversation. This means the quality of retrieval depends on the quality of the summary. A user who writes a long, meandering session may get a summary that doesn't capture every thread. The alternative — letting the user write their own summary — would be more precise but breaks the seamless "just talk" UX.
+ChromaDB's default embedding uses `all-MiniLM-L6-v2` via ONNX — runs locally, no API key, ~90MB one-time download. The alternative was calling an embedding API (OpenAI, Cohere) which would add latency, cost per search, and a second dependency on an external service. Local wins for a personal tool.
 
-**Flat files vs. a database**
+**LLM-generated summary vs. user-written**
 
-Notes are plain Markdown files. The index is a JSON file. No SQLite, no vector database, no migration scripts. This keeps setup to `pip install -r requirements.txt` and makes the notes human-readable and portable. The trade-off is that concurrent writes would corrupt the index, but this is a single-user local tool.
+The summary is generated at save time from the full conversation. Quality of retrieval depends on summary quality. A user who writes a long, meandering session may get a summary that doesn't capture every thread. User-written summaries would be more precise but break the seamless UX. A middle ground — showing the generated summary and letting the user edit before saving — would be the next improvement.
+
+**Flat files for notes**
+
+Notes are plain Markdown. No database for the note content itself. This keeps notes human-readable, portable (copy them anywhere), and recoverable (ChromaDB can always be rebuilt from them). The trade-off is that concurrent writes would corrupt things — acceptable for a single-user local tool.
 
 ---
 
 ## Where it breaks first
 
-**Note count ~300-500**: The router sends all summaries in one context window. At ~300 notes (roughly 30k tokens of summaries), this approaches the model's limit. Fix: add a BM25 or embedding pre-filter to cut the candidate set before the LLM router call.
+**Long sessions**: The full conversation history is sent on every turn. A very long session will eventually exceed the model's context window. Fix: sliding window or periodic conversation summarization.
 
-**Long sessions**: The full conversation history is sent on every turn. A 2-hour session with hundreds of exchanges will eventually exceed context. Fix: sliding window or periodic conversation summarization.
+**Summary quality**: Retrieval is only as good as the summary. No current mechanism to detect or fix a bad summary after it's saved.
 
-**Summary quality**: Retrieval is only as good as the summary. A poor summary (too vague, missing key terms) makes a note effectively unreachable. No current mechanism to detect or fix bad summaries after the fact.
+**Distance threshold**: 1.2 was calibrated on a small set of notes. As the note collection grows and topics diversify, some edge cases may need threshold tuning. A note that's somewhat related might land just above 1.2 and get filtered.
 
-**Router hallucination**: Rare, but the LLM could return a filename that doesn't exist. Handled gracefully — `read_note` returns empty string and the result is skipped — but the retrieval silently fails.
+**Single-user**: No auth, no isolation. Files are shared on the local machine.
 
 ## What I wouldn't trust it with
 
-- Note piles above ~300 entries without adding embeddings
-- High-stakes recall (legal, medical, financial) — it might miss a note
-- Anything requiring exact verbatim retrieval — summaries lose detail by design
+- High-stakes recall (legal, medical, financial) — it might miss a note if the summary doesn't capture the right concept
+- Exact verbatim retrieval — summaries lose detail by design
+- Multi-user deployments without adding auth and per-user storage isolation

@@ -2,20 +2,24 @@
 
 ## What I didn't get to
 
-**Embedding-based retrieval**: The LLM router scales to ~300-500 notes before the summary list overflows context. Beyond that, the right fix is a local embedding model (e.g. `all-MiniLM-L6-v2` via `sentence-transformers`) to pre-filter candidates before the LLM router call. Skipped because it adds PyTorch as a dependency (~1GB download) and the LLM router is already semantically strong for the realistic note pile size.
+**Web or TUI interface**: The interface is a terminal readline loop. A Streamlit app or a TUI (e.g. `textual`) would make the experience significantly better — streaming responses, visible note matches, a sidebar for recent notes. Skipped to keep scope tight; the spec says interface is not evaluated.
 
-**Conversation summarization**: Long sessions send the full message history on every turn. A sliding window or periodic summarization (compress old turns into a running summary) would keep the context bounded. Not done — sessions are naturally bounded in practice.
+**Streaming responses**: The assistant's reply arrives all at once after the full API call completes. Token-by-token streaming would make long responses feel much more responsive.
 
-**Note editing**: There's no way to update a note after it's saved. You'd have to edit the Markdown file manually and run `reindex`. A simple "edit last note" command would help.
+**Note editing**: No way to update a note after it's saved. You'd edit the Markdown file manually and run `reindex`. A "edit last note" command would cover the common case.
 
-**Chunking long notes**: A very long session produces a very long note. When that note is matched and injected into context, it can consume a large chunk of the answer call's context window. Chunking notes and only injecting the most relevant chunk (e.g. matching section) would help.
+**Summary quality feedback**: Retrieval quality depends entirely on the LLM-generated summary. There's no mechanism to detect a weak summary or let the user improve it before saving. Showing the draft summary and asking for confirmation before saving would help.
 
-**GUI / TUI**: The interface is a terminal readline loop. Works, but a TUI (e.g. `textual`) would make the experience noticeably better — streaming responses, visible note matches, a sidebar for recent notes.
+**Chunking long notes**: A very long session produces a long note. When that note is matched and injected into context, it can consume a large portion of the answer call's context window. Chunking notes and injecting only the most relevant section would help.
+
+**Conversation summarization for long sessions**: The full message history is sent on every turn. A sliding window or periodic summarization of older turns would keep context bounded for multi-hour sessions.
+
+**Distance threshold tuning**: The 1.2 cosine distance cutoff was calibrated on a small note set. It works well, but as the collection grows and topics diversify, some edge cases near the threshold may need manual tuning or an adaptive approach.
 
 ## What I'd improve with more time
 
-- Pre-filter with BM25 before the LLM router to extend the note pile limit
-- Stream the assistant's response token-by-token instead of waiting for the full reply
-- Show which note(s) were matched at the end of each response (opt-in, for transparency)
-- Let the user confirm or edit the generated note before saving
-- Detect when the user is asking about their activity inside normal conversation ("what have I been thinking about lately?") rather than requiring the `recap` command
+- Embed at a chunk level, not just summary level — index individual paragraphs so long notes can be partially matched
+- Show which note(s) were retrieved at the end of each response (opt-in, for transparency and debugging)
+- Detect activity queries ("what have I been thinking about lately?") inside normal conversation rather than requiring the `recap` command
+- Add a `delete` command to remove a note from both the filesystem and the vector index
+- Auto-reindex on startup if new `.md` files are detected that aren't in ChromaDB yet

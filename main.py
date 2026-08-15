@@ -76,7 +76,7 @@ def chat():
 
         messages.append({"role": "user", "content": user_input})
 
-        relevant = search_notes(user_input, client)
+        relevant = search_notes(user_input)
 
         response = client.chat.completions.create(
             model=MODEL,

@@ -1,10 +1,9 @@
 import re
-import json
 from datetime import datetime
 from pathlib import Path
+import vector_store
 
 NOTES_DIR = Path("notes")
-INDEX_FILE = NOTES_DIR / "index.json"
 MODEL = "llama-3.3-70b-versatile"
 
 NOTES_DIR.mkdir(exist_ok=True)
@@ -32,18 +31,6 @@ Only include sections that have content. Be precise and concise. Do not invent a
 """
 
 
-def load_index() -> list:
-    if INDEX_FILE.exists():
-        return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
-    return []
-
-
-def save_index(index: list):
-    INDEX_FILE.write_text(
-        json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-
-
 def slugify(title: str) -> str:
     s = title.lower()
     s = re.sub(r"[^\w\s-]", "", s)
@@ -52,7 +39,6 @@ def slugify(title: str) -> str:
 
 
 def parse_frontmatter(content: str) -> dict:
-    """Extract fields from YAML frontmatter. Falls back to body sections."""
     match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
     fm = {}
 
@@ -110,20 +96,13 @@ def save_note(content: str) -> Path:
     path = NOTES_DIR / f"{timestamp}-{slugify(title)}.md"
     path.write_text(content, encoding="utf-8")
 
-    index = load_index()
-    index.append(
-        {
-            "filename": path.name,
-            "title": title,
-            "date": fm.get("date", timestamp[:10]),
-            "tags": fm.get("tags", []),
-            "summary": fm.get("summary", ""),
-            "access_count": 0,
-            "last_accessed": None,
-            "created_at": datetime.now().isoformat(),
-        }
+    vector_store.add_note(
+        filename=path.name,
+        title=title,
+        date=fm.get("date", timestamp[:10]),
+        tags=fm.get("tags", []),
+        summary=fm.get("summary", ""),
     )
-    save_index(index)
     return path
 
 
@@ -132,29 +111,5 @@ def read_note(filename: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def rebuild_index():
-    """Scan all .md files in notes/ and rebuild index.json, preserving access stats."""
-    existing = {e["filename"]: e for e in load_index()}
-    md_files = sorted(NOTES_DIR.glob("*.md"))
-    index = []
-    for path in md_files:
-        content = path.read_text(encoding="utf-8")
-        fm = parse_frontmatter(content)
-        prev = existing.get(path.name, {})
-        index.append(
-            {
-                "filename": path.name,
-                "title": fm.get("title", path.stem),
-                "date": fm.get("date", ""),
-                "tags": fm.get("tags", []),
-                "summary": fm.get("summary", ""),
-                "access_count": prev.get("access_count", 0),
-                "last_accessed": prev.get("last_accessed", None),
-                "created_at": prev.get(
-                    "created_at",
-                    datetime.fromtimestamp(path.stat().st_ctime).isoformat(),
-                ),
-            }
-        )
-    save_index(index)
-    return len(index)
+def rebuild_index() -> int:
+    return vector_store.rebuild(NOTES_DIR, parse_frontmatter)
