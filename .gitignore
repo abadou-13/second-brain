@@ -1,4 +1,5 @@
 venv/
+brainenv/
 .env
 __pycache__/
 *.pyc
